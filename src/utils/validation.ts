@@ -41,11 +41,18 @@ export function validateMobileNumber(num: unknown, field = 'mobile_number'): str
   if (typeof num !== 'string' || !num) {
     throw new ValidationError(field, `${field} is required`);
   }
-  const cleaned = num.replace(/[\s\-()]/g, '');
-  if (!/^\d{10}$/.test(cleaned)) {
+  const cleaned = num.replace(/[\s\-()+]/g, '');
+  // Country-agnostic: the per-tenant common-masters.UserValidation 'mobile'
+  // rule (egov-user) is the source of truth for the exact pattern/length.
+  // Don't hardcode India's 10-digit here — that rejects Kenya (9, starts 1/7),
+  // Mozambique (9, starts 8), etc. before the request even reaches the backend.
+  // Just sanity-check it's digits of a plausible length; the backend enforces
+  // the tenant's real rule.
+  if (!/^\d{6,15}$/.test(cleaned)) {
     throw new ValidationError(
       field,
-      `${field} must be exactly 10 digits. Got "${num}" (${cleaned.length} digits after cleanup).`
+      `${field} must be 6-15 digits. Got "${num}" (${cleaned.length} digits after cleanup). ` +
+      `The tenant's common-masters.UserValidation 'mobile' rule enforces the exact pattern.`
     );
   }
   return cleaned;

@@ -170,7 +170,7 @@ export function registerPgrWorkflowTools(registry: ToolRegistry): void {
         },
         citizen_mobile: {
           type: 'string',
-          description: 'Mobile number of the citizen (required, 10 digits)',
+          description: 'Mobile number of the citizen (required; tenant UserValidation enforces the pattern)',
         },
         dry_run: {
           type: 'boolean',
