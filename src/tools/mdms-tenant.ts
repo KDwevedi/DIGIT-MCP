@@ -14,6 +14,36 @@ import type { ProbeReport } from '../utils/probe.js';
 import { loadFromXlsx } from '../utils/xlsx-loader.js';
 
 /**
+ * Derive a mobile number that satisfies the TARGET tenant's mobile rule.
+ *
+ * tenant_bootstrap copies an ADMIN from the source country, but that mobile
+ * won't match a different target country's UserValidation pattern (e.g. India
+ * `^[6-9][0-9]{9}$` vs Mozambique `^8[0-9]{8}$`). egov-user's _createnovalidate
+ * enforces the pattern, so the copied/fallback `9999999999` is rejected and the
+ * ADMIN row never gets created — login then fails. This generates a conforming
+ * placeholder from the same `mobile_regex` the bootstrap already receives.
+ *
+ * Returns `preferred` if it already matches; else the first-valid-lead-digit +
+ * a repeated tail padded to `length` that the regex accepts; else best-effort.
+ */
+export function deriveValidMobile(regex: string, length: number, preferred?: string): string {
+  let re: RegExp | null = null;
+  try { re = new RegExp(regex); } catch { re = null; }
+  const matches = (s?: string): s is string => !!s && (!re || re.test(s));
+  if (matches(preferred)) return preferred;
+  const n = length && length > 0 ? length : 10;
+  // Lead digit: a literal (`^8`) or the first member of a class (`^[6-9]`).
+  const body = (regex || '').replace(/^\^/, '');
+  const lead = body.match(/^\[([0-9])/) || body.match(/^([0-9])/);
+  const first = lead ? lead[1] : '9';
+  for (const d of ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']) {
+    const cand = first + d.repeat(Math.max(0, n - 1));
+    if (cand.length === n && matches(cand)) return cand;
+  }
+  return preferred || '9'.repeat(n);
+}
+
+/**
  * Search for MDMS records across all state tenants.
  * First queries the default state tenant to discover all root-level tenants,
  * then queries each discovered root to get the complete set.
@@ -877,6 +907,14 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
           type: 'string',
           description: 'Error message (or localization key) for the back-compat "mobile" rule.',
         },
+        admin_mobile: {
+          type: 'string',
+          description:
+            'Mobile number for the provisioned ADMIN user on the target tenant. Optional — ' +
+            'if omitted, a value conforming to mobile_regex is generated (the source country\'s ' +
+            'mobile would fail the target tenant\'s UserValidation, e.g. India 10-digit vs ' +
+            'Mozambique ^8[0-9]{8}$). Set it to pin a specific number.',
+        },
         user_validation: {
           type: 'array',
           description:
@@ -1356,7 +1394,14 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
         const sourceUser = existingUsers[0];
         const userName = (sourceUser?.userName as string) || currentUsername;
         const name = (sourceUser?.name as string) || 'Admin';
-        const mobileNumber = (sourceUser?.mobileNumber as string) || '9999999999';
+        // Must satisfy the TARGET tenant's mobile rule, not the source country's.
+        // Prefer an explicit admin_mobile, else the source mobile if it happens
+        // to validate, else generate a conforming one from mobile_regex.
+        const mobileNumber = deriveValidMobile(
+          mobileRegex,
+          Number(args.mobile_length) || 10,
+          (args.admin_mobile as string) || (sourceUser?.mobileNumber as string),
+        );
 
         // Standard roles needed for full platform operations on the new tenant
         const standardRoles = [
@@ -1721,7 +1766,12 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
               const userPayload: Record<string, unknown> = {
                 name: (adminRecord?.name as string) || 'Administrator',
                 userName: adminUserName,
-                mobileNumber: (adminRecord?.mobileNumber as string) || '9999999999',
+                // Same target-tenant mobile rule applies to the HRMS user payload.
+                mobileNumber: deriveValidMobile(
+                  mobileRegex,
+                  Number(args.mobile_length) || 10,
+                  (args.admin_mobile as string) || (adminRecord?.mobileNumber as string),
+                ),
                 emailId: (adminRecord?.emailId as string) || null,
                 gender: (adminRecord?.gender as string) || 'MALE',
                 type: 'EMPLOYEE',
