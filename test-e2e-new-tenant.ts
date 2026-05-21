@@ -204,6 +204,10 @@ async function main() {
     const r = await call('tenant_bootstrap', {
       target_tenant: state.bootstrapRoot,
       source_tenant: 'pg',
+      // Exercise the config-driven UserValidation synth with a non-default
+      // (9-digit, MZ-style) mobile rule so steps 5a/5b can assert it landed.
+      mobile_regex: '^8[0-9]{8}$',
+      mobile_length: 9,
     });
     const summary = r.summary as Record<string, number> | undefined;
     const schemasCopied = summary?.schemas_copied ?? 0;
@@ -250,6 +254,44 @@ async function main() {
     const validation = r.validation as Record<string, unknown>;
     console.log(`        ${validation.summary}`);
     return ['validate_designations'];
+  });
+
+  // 5a. UserValidation 'mobile' rule synthesized with the right shape.
+  // Source tenants ship no UserValidation; tenant_bootstrap must synthesize
+  // the egov-user ValidationData shape { fieldType:'mobile', isActive,
+  // rules:{pattern,minLength,maxLength} } at the EXACT tenant, or citizen
+  // register falls back to the hardcoded 10-digit regex.
+  await testWithDeps('5a UserValidation mobile rule synthesized', ['2 bootstrap new root tenant'], async () => {
+    await wait(2000, 'MDMS data propagation');
+    const r = await call('mdms_search', {
+      tenant_id: state.bootstrapRoot,
+      schema_code: 'common-masters.UserValidation',
+    });
+    assert(r.success === true, `mdms_search UserValidation failed: ${r.error}`);
+    // mdms_search returns { records: [{ uniqueIdentifier, data:{...}, isActive }] }
+    const recs = (r.records as Array<{ data?: Record<string, unknown> }>) || [];
+    const mobile = recs.map((x) => x.data || {}).find((d) => d.fieldType === 'mobile');
+    assert(!!mobile, `No UserValidation record with fieldType='mobile' (got ${recs.length} records)`);
+    const rules = (mobile as { rules?: Record<string, unknown> }).rules || {};
+    assert(rules.pattern === '^8[0-9]{8}$', `mobile pattern wrong: ${JSON.stringify(rules.pattern)}`);
+    assert(Number(rules.minLength) === 9 && Number(rules.maxLength) === 9, `mobile length wrong: ${rules.minLength}/${rules.maxLength}`);
+    console.log(`        UserValidation/mobile: pattern=${rules.pattern} len=${rules.minLength}-${rules.maxLength}`);
+    return ['mdms_search'];
+  });
+
+  // 5b. ACCESSCONTROL-ACTIONS.actions bridged from -TEST.
+  // egov-accesscontrol reads the non-TEST schema; pg ships only -TEST.
+  // The bridge must clone rows (preserving data.id) or the employee UI is blank.
+  await testWithDeps('5b ACCESSCONTROL-ACTIONS bridged', ['2 bootstrap new root tenant'], async () => {
+    const r = await call('mdms_search', {
+      tenant_id: state.bootstrapRoot,
+      schema_code: 'ACCESSCONTROL-ACTIONS.actions',
+    });
+    assert(r.success === true, `mdms_search ACCESSCONTROL-ACTIONS.actions failed: ${r.error}`);
+    const count = (r.count as number) ?? ((r.data as unknown[]) || []).length;
+    assert(count > 0, `ACCESSCONTROL-ACTIONS.actions empty — bridge from -TEST didn't run (got ${count})`);
+    console.log(`        ACCESSCONTROL-ACTIONS.actions: ${count} rows bridged`);
+    return ['mdms_search'];
   });
 
   // ──────────────────────────────────────────────────────────────────
