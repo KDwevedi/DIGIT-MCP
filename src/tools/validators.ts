@@ -806,7 +806,57 @@ export function registerValidatorTools(registry: ToolRegistry): void {
         }
       }
 
-      // Step 3: Create relationships top-down (ordered by hierarchy level)
+      // Step 2.5: ENTITY GATE — wait until every entity write is visible before
+      // creating relationships. boundary-service entity _create returns 200
+      // before the row is consistently readable; relationship _create validates
+      // entity existence against the store, so without this barrier a subset of
+      // relationship calls outrun their entity and fail BOUNDARY_ENTITY_DOES_NOT_EXIST
+      // (and their Quarteirão/leaf children cascade). Poll boundary search until
+      // all expected codes are present, then proceed.
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      // /boundary/_search caps results (~300), so verify the exact codes via the
+      // `codes` filter in chunks rather than counting one big search.
+      const expectedCodeList = boundaries.map((b) => b.code);
+      const expectedCount = new Set(expectedCodeList).size;
+      const GATE_TIMEOUT_MS = 180000;
+      const GATE_INTERVAL_MS = 2000;
+      const CODES_CHUNK = 200;
+      const countVisibleEntities = async (): Promise<number> => {
+        const seen = new Set<string>();
+        for (let i = 0; i < expectedCodeList.length; i += CODES_CHUNK) {
+          const chunk = expectedCodeList.slice(i, i + CODES_CHUNK);
+          // explicit limit: /boundary/_search defaults to 50 results even when
+          // codes are supplied, so without this the gate undercounts and stalls.
+          const res = await digitApi
+            .boundarySearch(tenantId, undefined, { codes: chunk, limit: chunk.length })
+            .catch(() => [] as Record<string, unknown>[]);
+          const present = new Set((res as Record<string, unknown>[]).map((e) => e.code as string));
+          for (const c of chunk) if (present.has(c)) seen.add(c);
+        }
+        return seen.size;
+      };
+      const gateStart = Date.now();
+      let entitiesVisible = 0;
+      while (Date.now() - gateStart < GATE_TIMEOUT_MS) {
+        entitiesVisible = await countVisibleEntities();
+        if (entitiesVisible >= expectedCount) break;
+        await sleep(GATE_INTERVAL_MS);
+      }
+      const entityGate = {
+        expected: expectedCount,
+        visible: entitiesVisible,
+        complete: entitiesVisible >= expectedCount,
+        waitedMs: Date.now() - gateStart,
+      };
+      if (!entityGate.complete) {
+        console.error(
+          `[boundary_create] entity gate: only ${entitiesVisible}/${expectedCount} visible after ${entityGate.waitedMs}ms — relationships will retry stragglers`,
+        );
+      }
+
+      // Step 3: Create relationships top-down (ordered by hierarchy level), with
+      // a bounded retry for any entity still not visible / parent not yet linked
+      // (cascade) despite the gate.
       const levelOrder = new Map(hierarchyLevels.map((l, i) => [l, i]));
       const sorted = [...boundaries].sort((a, b) => {
         const aOrder = levelOrder.get(a.type) ?? 999;
@@ -814,24 +864,35 @@ export function registerValidatorTools(registry: ToolRegistry): void {
         return aOrder - bOrder;
       });
 
-      for (const b of sorted) {
-        try {
-          await digitApi.boundaryRelationshipCreate(
-            tenantId,
-            b.code,
-            hierarchyType,
-            b.type,
-            b.parent || null
-          );
-          results.relationshipsCreated.push(b.code);
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          if (msg.includes('DUPLICATE') || msg.includes('already exists') || msg.includes('unique')) {
-            results.relationshipsSkipped.push(b.code);
-          } else {
-            results.errors.push({ code: b.code, step: 'relationship_create', error: msg });
+      const isMissingEntity = (m: string) =>
+        m.includes('DOES_NOT_EXIST') || m.includes('does not exist') || m.includes('not found');
+      const MAX_PASSES = 4;
+      let pending = sorted;
+      for (let pass = 0; pass < MAX_PASSES && pending.length > 0; pass++) {
+        if (pass > 0) await sleep(2000);
+        const stillPending: typeof pending = [];
+        for (const b of pending) {
+          try {
+            await digitApi.boundaryRelationshipCreate(
+              tenantId,
+              b.code,
+              hierarchyType,
+              b.type,
+              b.parent || null,
+            );
+            results.relationshipsCreated.push(b.code);
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            if (msg.includes('DUPLICATE') || msg.includes('already exists') || msg.includes('unique')) {
+              results.relationshipsSkipped.push(b.code);
+            } else if (isMissingEntity(msg) && pass < MAX_PASSES - 1) {
+              stillPending.push(b); // entity not visible yet or parent cascade — retry next pass
+            } else {
+              results.errors.push({ code: b.code, step: 'relationship_create', error: msg });
+            }
           }
         }
+        pending = stillPending;
       }
 
       return JSON.stringify({
@@ -841,6 +902,7 @@ export function registerValidatorTools(registry: ToolRegistry): void {
         summary: {
           entitiesCreated: results.entitiesCreated.length,
           entitiesSkipped: results.entitiesSkipped.length,
+          entityGate,
           relationshipsCreated: results.relationshipsCreated.length,
           relationshipsSkipped: results.relationshipsSkipped.length,
           errors: results.errors.length,

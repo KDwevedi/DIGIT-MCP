@@ -251,12 +251,11 @@ async function runBoundaryPhase(
   const entityFailures: string[] = [];
   const relFailures: string[] = [];
 
+  // ── Phase A: create ALL entities first (every level), batched ──
+  // egov-boundary-service /boundary/_create takes an array, so 100-at-a-time
+  // keeps round-trips low without blowing past payload limits.
   for (const level of fileLevels) {
     const levelRows = rowsByLevel.get(level) ?? [];
-
-    // Entities first (batched). egov-boundary-service /boundary/_create
-    // takes an array, so 100-at-a-time keeps round-trips low without
-    // blowing past payload limits.
     const BATCH = 100;
     for (let i = 0; i < levelRows.length; i += BATCH) {
       const batch = levelRows.slice(i, i + BATCH);
@@ -288,18 +287,61 @@ async function runBoundaryPhase(
         }
       }
     }
+  }
 
-    // Relationships one-at-a-time. The API only takes singletons, and the
-    // boundary-service occasionally returns "Boundary entity does not exist"
-    // or "Parent entity for current boundary relationship does not exist"
-    // even when the row is in the DB — Kafka/cache lag from the batched
-    // entity creates above. Re-queue race-style failures and retry with
-    // backoff before declaring real failure.
+  // ── Phase B: ENTITY GATE — wait until every entity is readable before any
+  // relationship is created. boundary-service entity _create is Kafka-backed:
+  // it returns 200 before the row is consistently readable, and relationship
+  // _create validates entity existence, so without this barrier a subset of
+  // relationships race ahead of their entity ("Boundary entity does not exist")
+  // and their children cascade. (A per-level ~5s retry can't keep up at
+  // thousands of rows.) Poll boundary search until all expected codes appear.
+  // /boundary/_search caps results (~300), so we can't count all entities in
+  // one call — verify the exact codes via the `codes` filter in chunks.
+  const expectedCodeList = rows.map((r) => r.code);
+  const expectedCount = new Set(expectedCodeList).size;
+  const GATE_TIMEOUT_MS = 180000;
+  const GATE_INTERVAL_MS = 2000;
+  const CODES_CHUNK = 200; // keep each query under the result cap
+  const countVisibleEntities = async (): Promise<number> => {
+    const seen = new Set<string>();
+    for (let i = 0; i < expectedCodeList.length; i += CODES_CHUNK) {
+      const chunk = expectedCodeList.slice(i, i + CODES_CHUNK);
+      // explicit limit: /boundary/_search defaults to 50 results even when
+      // codes are supplied, so without this the gate undercounts and stalls.
+      const res = await digitApi
+        .boundarySearch(tenantId, undefined, { codes: chunk, limit: chunk.length })
+        .catch(() => [] as Record<string, unknown>[]);
+      const present = new Set((res as Record<string, unknown>[]).map((e) => e.code as string));
+      for (const c of chunk) if (present.has(c)) seen.add(c);
+    }
+    return seen.size;
+  };
+  const gateStart = Date.now();
+  let entitiesVisible = 0;
+  while (Date.now() - gateStart < GATE_TIMEOUT_MS) {
+    entitiesVisible = await countVisibleEntities();
+    if (entitiesVisible >= expectedCount) break;
+    await new Promise((resolve) => setTimeout(resolve, GATE_INTERVAL_MS));
+  }
+  const entityGate = {
+    expected: expectedCount,
+    visible: entitiesVisible,
+    complete: entitiesVisible >= expectedCount,
+    waitedMs: Date.now() - gateStart,
+  };
+
+  // ── Phase C: create relationships top-down (levels root→leaf). A child
+  // relationship needs its parent's relationship to exist, so level order
+  // matters; the gate above guarantees the entities are visible. Keep a
+  // bounded retry as a safety net for any residual lag / parent stragglers.
+  for (const level of fileLevels) {
+    const levelRows = rowsByLevel.get(level) ?? [];
     const pending: BoundaryRow[] = [...levelRows];
     const maxPasses = 5;
     for (let pass = 0; pass < maxPasses && pending.length > 0; pass++) {
       if (pass > 0) {
-        const backoffMs = 500 * pass;
+        const backoffMs = 1000 * pass;
         await new Promise((resolve) => setTimeout(resolve, backoffMs));
       }
       const stillPending: BoundaryRow[] = [];
@@ -313,7 +355,7 @@ async function runBoundaryPhase(
           const msg = err instanceof Error ? err.message : String(err);
           if (/already exists|duplicate/i.test(msg)) {
             relStats.exists++;
-          } else if (/entity does not exist|parent.*does not exist/i.test(msg) && pass < maxPasses - 1) {
+          } else if (/does not exist|DOES_NOT_EXIST/i.test(msg) && pass < maxPasses - 1) {
             stillPending.push(b);
           } else {
             relStats.failed++;
@@ -345,7 +387,7 @@ async function runBoundaryPhase(
     hierarchyType,
     hierarchyAction,
     levels: fileLevels,
-    counts: { entities: entityStats, relationships: relStats, total_rows: rows.length },
+    counts: { entities: entityStats, relationships: relStats, total_rows: rows.length, entity_gate: entityGate },
     entity_failures: entityFailures,
     relationship_failures: relFailures,
     context,
