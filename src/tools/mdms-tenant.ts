@@ -859,6 +859,20 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
           type: 'string',
           description: 'Existing tenant root to copy from (default: "pg")',
         },
+        mobile_regex: {
+          type: 'string',
+          description:
+            'Mobile-number regex for the synthesized common-masters.UserValidation "mobile" rule ' +
+            '(citizen register). Source tenants (pg/statea) ship no UserValidation, so it must ' +
+            'be synthesized, not copied. Default "^[6-9][0-9]{9}$" (India 10-digit). ' +
+            'Kenya: "^[17][0-9]{8}$". Mozambique: "^8[0-9]{8}$".',
+        },
+        mobile_length: {
+          type: 'integer',
+          description:
+            'Mobile-number length (min=max) for the UserValidation "mobile" rule. ' +
+            'Default 10 (India). Kenya/Mozambique: 9.',
+        },
       },
       required: ['target_tenant'],
     },
@@ -870,6 +884,7 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
 
       const target = args.target_tenant as string;
       const source = (args.source_tenant as string) || 'pg';
+      const mobileRegex = (args.mobile_regex as string) || '^[6-9][0-9]{9}$';
 
       const results: {
         schemas: { copied: string[]; skipped: string[]; failed: string[] };
@@ -1168,6 +1183,120 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
         },
         pct: 75,
       });
+
+      // ── Step 3b: synthesize common-masters.UserValidation ───────────────
+      // Source tenants (pg/statea) ship NO UserValidation. Without a 'mobile'
+      // field rule egov-user falls back to a hardcoded 10-digit regex and
+      // rejects 8/9-digit numbers (Kenya/Mozambique) → citizen register fails
+      // INVALID_MOBILE_LENGTH.
+      //
+      // SHAPE (egov-user >=1.2.8 MobileNumberValidator / ValidationData model):
+      //   one record per field, data = { fieldType, isActive, rules:{
+      //   pattern, minLength, maxLength, errorMessage } }. The validator
+      //   filters by fieldType=='mobile' && isActive. (The old flat
+      //   {userName,mobileNumber,...} regex map is NOT read by this build.)
+      //
+      // uid: x-unique:['fieldType'] → mdms-v2 derives uid from data.fieldType
+      //   value ('mobile'). (x-unique IS required by mdms-v2 schema-create;
+      //   pointing it at fieldType gives a stable, correct uid.)
+      emitProgress({ phase: 'uservalidation:start', message: 'Synthesizing UserValidation mobile rule (citizen register)', pct: 76 });
+      try {
+        try {
+          await digitApi.mdmsSchemaCreate(target, 'common-masters.UserValidation',
+            'Per-field user validation rules (egov-user ValidationData)', {
+              type: 'object',
+              title: 'UserValidation',
+              $schema: 'http://json-schema.org/draft-07/schema#',
+              required: ['fieldType'],
+              'x-unique': ['fieldType'],
+              properties: {
+                fieldType: { type: 'string' },
+                isActive: { type: 'boolean' },
+                rules: {
+                  type: 'object',
+                  properties: {
+                    pattern: { type: 'string' },
+                    minLength: { type: 'integer' },
+                    maxLength: { type: 'integer' },
+                    errorMessage: { type: 'string' },
+                  },
+                },
+              },
+              additionalProperties: true,
+            });
+        } catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          if (!/DUPLICATE|already exists|unique/i.test(m)) throw e;
+        }
+        // mdms-v2 search is HIERARCHICAL — querying a city tenant returns the
+        // state root's rows too. egov-user resolves UserValidation by EXACT
+        // tenant, so filter the existence check to exact-tenant 'mobile' rows.
+        const existingUVraw = await digitApi.mdmsV2SearchRaw(target, 'common-masters.UserValidation', { limit: 50 });
+        const haveMobile = existingUVraw.some(
+          (r) => (r as { tenantId?: string }).tenantId === target
+            && ((r as { data?: { fieldType?: string } }).data?.fieldType === 'mobile'),
+        );
+        if (!haveMobile) {
+          const mobileLen = Number(args.mobile_length) || 10;
+          await mdmsCreateWithSchemaWait(target, 'common-masters.UserValidation', 'mobile', {
+            fieldType: 'mobile',
+            isActive: true,
+            rules: {
+              pattern: mobileRegex,
+              minLength: mobileLen,
+              maxLength: mobileLen,
+              errorMessage: `Invalid mobile number (expected ${mobileLen} digits matching ${mobileRegex})`,
+            },
+          });
+          results.data.copied.push(`common-masters.UserValidation/mobile (synthesized, pattern=${mobileRegex}, len=${mobileLen})`);
+        } else {
+          results.data.skipped.push('common-masters.UserValidation/mobile');
+        }
+      } catch (e) {
+        results.data.failed.push(`common-masters.UserValidation: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      // ── Step 3c: bridge ACCESSCONTROL-ACTIONS.actions from -TEST ─────────
+      // egov-accesscontrol reads ACCESSCONTROL-ACTIONS.actions, but pg/statea
+      // ship only ACCESSCONTROL-ACTIONS-TEST.actions-test. Clone the schema
+      // def under the non-TEST code and copy every row PRESERVING data.id so
+      // roleactions.actionid cross-refs still resolve. Without this the
+      // employee UI renders blank (no actions → no menu).
+      emitProgress({ phase: 'actions_bridge:start', message: 'Bridging ACCESSCONTROL-ACTIONS.actions ← actions-test', pct: 78 });
+      try {
+        const haveActions = await digitApi.mdmsSchemaSearch(target, ['ACCESSCONTROL-ACTIONS.actions']).catch(() => []);
+        if (!haveActions || haveActions.length === 0) {
+          const testSchema = (await digitApi.mdmsSchemaSearch(target, ['ACCESSCONTROL-ACTIONS-TEST.actions-test']).catch(() => []))[0];
+          if (testSchema) {
+            await digitApi.mdmsSchemaCreate(target, 'ACCESSCONTROL-ACTIONS.actions',
+              (testSchema.description as string) || 'AccessControl actions (bridged from actions-test)',
+              testSchema.definition as Record<string, unknown>).catch((e: unknown) => {
+                const m = e instanceof Error ? e.message : String(e);
+                if (!/DUPLICATE|already exists|unique/i.test(m)) throw e;
+              });
+          }
+        }
+        const testRows = await digitApi.mdmsV2SearchRaw(target, 'ACCESSCONTROL-ACTIONS-TEST.actions-test', { limit: 500 });
+        const haveRows = await digitApi.mdmsV2SearchRaw(target, 'ACCESSCONTROL-ACTIONS.actions', { limit: 500 });
+        const haveUid = new Set(haveRows.map((r) => r.uniqueIdentifier));
+        let bridged = 0;
+        for (const r of testRows) {
+          if (haveUid.has(r.uniqueIdentifier)) continue;
+          try {
+            await mdmsCreateWithSchemaWait(target, 'ACCESSCONTROL-ACTIONS.actions',
+              r.uniqueIdentifier as string, r.data as Record<string, unknown>);
+            bridged++;
+          } catch (e) {
+            const m = e instanceof Error ? e.message : String(e);
+            if (!/DUPLICATE|already exists|unique/i.test(m)) {
+              results.data.failed.push(`ACCESSCONTROL-ACTIONS.actions/${r.uniqueIdentifier}: ${m}`);
+            }
+          }
+        }
+        if (bridged > 0) results.data.copied.push(`ACCESSCONTROL-ACTIONS.actions (bridged ${bridged} rows from -TEST)`);
+      } catch (e) {
+        results.data.failed.push(`ACCESSCONTROL-ACTIONS.actions bridge: ${e instanceof Error ? e.message : String(e)}`);
+      }
 
       emitProgress({ phase: 'admin:start', message: 'Provisioning ADMIN user on the new tenant', pct: 80 });
 
