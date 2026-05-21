@@ -870,8 +870,30 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
         mobile_length: {
           type: 'integer',
           description:
-            'Mobile-number length (min=max) for the UserValidation "mobile" rule. ' +
-            'Default 10 (India). Kenya/Mozambique: 9.',
+            'Mobile-number length (min=max) for the back-compat "mobile" UserValidation rule. ' +
+            'Default 10 (India). Kenya/Mozambique: 9. Ignored when user_validation is supplied.',
+        },
+        mobile_error_message: {
+          type: 'string',
+          description: 'Error message (or localization key) for the back-compat "mobile" rule.',
+        },
+        user_validation: {
+          type: 'array',
+          description:
+            'Config-driven user-field validation rules — one entry per field. Fully declarative: ' +
+            'a new country/field is config, not code. Each entry maps to a common-masters.UserValidation ' +
+            'record (egov-user ValidationData). When supplied, supersedes mobile_regex/mobile_length.',
+          items: {
+            type: 'object',
+            properties: {
+              fieldType: { type: 'string', description: 'e.g. "mobile", "userName", "email", "name"' },
+              pattern: { type: 'string', description: 'regex the field value must match' },
+              minLength: { type: 'integer' },
+              maxLength: { type: 'integer' },
+              errorMessage: { type: 'string', description: 'message or localization key' },
+            },
+            required: ['fieldType', 'pattern'],
+          },
         },
       },
       required: ['target_tenant'],
@@ -1184,7 +1206,7 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
         pct: 75,
       });
 
-      // ── Step 3b: synthesize common-masters.UserValidation ───────────────
+      // ── Step 3b: synthesize common-masters.UserValidation (config-driven) ─
       // Source tenants (pg/statea) ship NO UserValidation. Without a 'mobile'
       // field rule egov-user falls back to a hardcoded 10-digit regex and
       // rejects 8/9-digit numbers (Kenya/Mozambique) → citizen register fails
@@ -1193,13 +1215,25 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
       // SHAPE (egov-user >=1.2.8 MobileNumberValidator / ValidationData model):
       //   one record per field, data = { fieldType, isActive, rules:{
       //   pattern, minLength, maxLength, errorMessage } }. The validator
-      //   filters by fieldType=='mobile' && isActive. (The old flat
-      //   {userName,mobileNumber,...} regex map is NOT read by this build.)
+      //   filters by fieldType && isActive. uid via x-unique:['fieldType'].
       //
-      // uid: x-unique:['fieldType'] → mdms-v2 derives uid from data.fieldType
-      //   value ('mobile'). (x-unique IS required by mdms-v2 schema-create;
-      //   pointing it at fieldType gives a stable, correct uid.)
-      emitProgress({ phase: 'uservalidation:start', message: 'Synthesizing UserValidation mobile rule (citizen register)', pct: 76 });
+      // FULLY CONFIG-DRIVEN: the caller passes `user_validation` — a list of
+      // { fieldType, pattern, minLength, maxLength, errorMessage } — so a new
+      // country/field is pure config, no code. `mobile_regex`/`mobile_length`
+      // are a back-compat shorthand that builds a single 'mobile' entry when
+      // `user_validation` isn't supplied.
+      const validationRules: Array<{ fieldType: string; pattern: string; minLength?: number; maxLength?: number; errorMessage?: string }> =
+        Array.isArray(args.user_validation) && (args.user_validation as unknown[]).length > 0
+          ? (args.user_validation as typeof validationRules)
+          : [{
+              fieldType: 'mobile',
+              pattern: mobileRegex,
+              minLength: Number(args.mobile_length) || 10,
+              maxLength: Number(args.mobile_length) || 10,
+              errorMessage: (args.mobile_error_message as string) ||
+                `Invalid mobile number (expected ${Number(args.mobile_length) || 10} digits matching ${mobileRegex})`,
+            }];
+      emitProgress({ phase: 'uservalidation:start', message: `Synthesizing ${validationRules.length} UserValidation rule(s)`, pct: 76 });
       try {
         try {
           await digitApi.mdmsSchemaCreate(target, 'common-masters.UserValidation',
@@ -1228,29 +1262,30 @@ export function registerMdmsTenantTools(registry: ToolRegistry): void {
           const m = e instanceof Error ? e.message : String(e);
           if (!/DUPLICATE|already exists|unique/i.test(m)) throw e;
         }
-        // mdms-v2 search is HIERARCHICAL — querying a city tenant returns the
-        // state root's rows too. egov-user resolves UserValidation by EXACT
-        // tenant, so filter the existence check to exact-tenant 'mobile' rows.
+        // mdms-v2 search is HIERARCHICAL — a city query returns the root's rows
+        // too. egov-user resolves UserValidation by EXACT tenant, so filter the
+        // existence check to exact-tenant rows by fieldType.
         const existingUVraw = await digitApi.mdmsV2SearchRaw(target, 'common-masters.UserValidation', { limit: 50 });
-        const haveMobile = existingUVraw.some(
+        const haveField = (ft: string) => existingUVraw.some(
           (r) => (r as { tenantId?: string }).tenantId === target
-            && ((r as { data?: { fieldType?: string } }).data?.fieldType === 'mobile'),
+            && ((r as { data?: { fieldType?: string } }).data?.fieldType === ft),
         );
-        if (!haveMobile) {
-          const mobileLen = Number(args.mobile_length) || 10;
-          await mdmsCreateWithSchemaWait(target, 'common-masters.UserValidation', 'mobile', {
-            fieldType: 'mobile',
+        for (const rule of validationRules) {
+          if (haveField(rule.fieldType)) {
+            results.data.skipped.push(`common-masters.UserValidation/${rule.fieldType}`);
+            continue;
+          }
+          await mdmsCreateWithSchemaWait(target, 'common-masters.UserValidation', rule.fieldType, {
+            fieldType: rule.fieldType,
             isActive: true,
             rules: {
-              pattern: mobileRegex,
-              minLength: mobileLen,
-              maxLength: mobileLen,
-              errorMessage: `Invalid mobile number (expected ${mobileLen} digits matching ${mobileRegex})`,
+              pattern: rule.pattern,
+              minLength: rule.minLength ?? undefined,
+              maxLength: rule.maxLength ?? undefined,
+              errorMessage: rule.errorMessage ?? `Invalid ${rule.fieldType}`,
             },
           });
-          results.data.copied.push(`common-masters.UserValidation/mobile (synthesized, pattern=${mobileRegex}, len=${mobileLen})`);
-        } else {
-          results.data.skipped.push('common-masters.UserValidation/mobile');
+          results.data.copied.push(`common-masters.UserValidation/${rule.fieldType} (synthesized, pattern=${rule.pattern})`);
         }
       } catch (e) {
         results.data.failed.push(`common-masters.UserValidation: ${e instanceof Error ? e.message : String(e)}`);
