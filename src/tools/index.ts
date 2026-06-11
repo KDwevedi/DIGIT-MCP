@@ -15,6 +15,7 @@ import { registerMonitoringTools } from './monitoring.js';
 import { registerTracingTools } from './tracing.js';
 import { registerApiCatalogTools } from './api-catalog.js';
 import { registerSessionTools } from './sessions.js';
+import { registerSnapshotTools } from './snapshot.js';
 
 export function registerAllTools(registry: ToolRegistry): void {
   registerDiscoverTools(registry);
@@ -33,4 +34,5 @@ export function registerAllTools(registry: ToolRegistry): void {
   registerTracingTools(registry);
   registerApiCatalogTools(registry);
   registerSessionTools(registry);
+  registerSnapshotTools(registry);
 }
